@@ -10,19 +10,19 @@
 
 A component uses callbacks (like LangChain traces) to capture event-like data. Is this Event-Driven Architecture (EDA) or Event Sourcing (ES)?
 
-### Answer: **Event-Driven Architecture (EDA)**
+### Answer: Event-Driven Architecture (EDA)
 
 ### Core Distinction
 
 ```markdown
 | Aspect | EDA (LangChain Traces) | Event Sourcing (The Ledger) |
 |--------|------------------------|----------------------------|
-| **Primary Purpose** | Notify subscribers about events | Events ARE the source of truth |
-| **Persistence** | Optional, often volatile | Immutable, ACID-guaranteed |
-| **State Reconstruction** | Impossible from events alone | Complete replay capability |
-| **Crash Recovery** | Context lost forever | Full context reconstruction |
-| **Audit Trail** | Best-effort logging | Cryptographic proof |
-| **Query Capability** | Log inspection only | Temporal queries, projections |
+| Primary Purpose | Notify subscribers about events | Events ARE the source of truth |
+| Persistence | Optional, often volatile | Immutable, ACID-guaranteed |
+| State Reconstruction | Impossible from events alone | Complete replay capability |
+| Crash Recovery | Context lost forever | Full context reconstruction |
+| Audit Trail | Best-effort logging | Cryptographic proof |
+| Query Capability | Log inspection only | Temporal queries, projections |
 ```
 
 ### What Changes with The Ledger
@@ -50,11 +50,11 @@ graph TB
 ```markdown
 | Gain | Before | After |
 |------|--------|-------|
-| **Auditability** | "The log says X" | "Here's the signed event with hash chain" |
-| **Recoverability** | Start from scratch on crash | Resume exactly where left off |
-| **Temporal Queries** | Impossible | "Show me state on March 15" |
-| **Regulatory Compliance** | Scattered logs | Complete decision provenance |
-| **Business Rules** | Best-effort UI validation | Enforced atomically with events |
+| Auditability | "The log says X" | "Here's the signed event with hash chain" |
+| Recoverability | Start from scratch on crash | Resume exactly where left off |
+| Temporal Queries | Impossible | "Show me state on March 15" |
+| Regulatory Compliance | Scattered logs | Complete decision provenance |
+| Business Rules | Best-effort UI validation | Enforced atomically with events |
 ```
 
 ## 2. Aggregate Boundary Decisions
@@ -64,10 +64,10 @@ graph TB
 ```markdown
 | Aggregate | Stream ID | What It Tracks |
 |-----------|-----------|----------------|
-| **LoanApplication** | `loan-{id}` | Full loan lifecycle, state machine |
-| **AgentSession** | `agent-{id}-{session}` | AI agent context, Gas Town pattern |
-| **ComplianceRecord** | `compliance-{id}` | Regulatory checks, rule versions |
-| **AuditLedger** | `audit-{entity}-{id}` | Cross-cutting audit trail |
+|LoanApplication | `loan-{id}` | Full loan lifecycle, state machine |
+|AgentSession | `agent-{id}-{session}` | AI agent context, Gas Town pattern |
+|ComplianceRecord | `compliance-{id}` | Regulatory checks, rule versions |
+|AuditLedger | `audit-{entity}-{id}` | Cross-cutting audit trail |
 ```
 
 ### Alternative Boundary Considered and Rejected
