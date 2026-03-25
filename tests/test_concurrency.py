@@ -21,9 +21,9 @@ from datetime import datetime
 from uuid import uuid4
 from decimal import Decimal
 
-from ledger.event_store import InMemoryEventStore, OptimisticConcurrencyError
-from ledger.commands.handlers import CommandHandlers
-from ledger.schema.events import (
+from ..src.event_store import InMemoryEventStore, OptimisticConcurrencyError
+from ..src.commands.handlers import CommandHandlers
+from ..src.schema.events import (
     ApplicationSubmitted,
     CreditAnalysisCompleted,
     CreditDecision,
