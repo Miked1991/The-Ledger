@@ -1,219 +1,289 @@
 # src/projections/daemon.py
 """
-Async projection daemon for building read models.
+Async Projection Daemon - Fault-tolerant background processor for async projections.
+Implements checkpoint management, retry logic, and lag monitoring.
 """
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any
+from typing import List, Dict, Optional, Any, Set
 from datetime import datetime
-import asyncpg
-
-from ..event_store import EventStore
-from .base import Projection
-from ..models.errors import ProjectionError
+from src.event_store import EventStore
+from src.models.events import StoredEvent
+from src.projections.base import Projection, AsyncProjection
 
 logger = logging.getLogger(__name__)
 
 
 class ProjectionDaemon:
     """
-    Async daemon that processes events and updates projections.
+    Async daemon that processes events and updates async projections.
+    Implements fault-tolerant batch processing with checkpoint management.
     
     Features:
-    - Fault-tolerant batch processing
-    - Per-projection checkpoint management
-    - Configurable retry with backoff
-    - Lag metrics exposure
+    - Checkpoint persistence for crash recovery
+    - Configurable retry with exponential backoff
+    - Lag monitoring for SLO compliance
+    - Batch processing for efficiency
+    - Dead letter queue for failed events
     """
     
     def __init__(
-        self,
-        store: EventStore,
-        projections: List[Projection],
-        batch_size: int = 100,
+        self, 
+        store: EventStore, 
+        projections: List[Projection], 
         max_retries: int = 3,
-        retry_delay_ms: int = 1000
+        batch_size: int = 100,
+        poll_interval_ms: int = 100,
+        dead_letter_queue_enabled: bool = True
     ):
-        """
-        Initialize projection daemon.
-        
-        Args:
-            store: Event store instance
-            projections: List of projections to maintain
-            batch_size: Number of events to process per batch
-            max_retries: Maximum retry attempts for failed events
-            retry_delay_ms: Delay between retries
-        """
         self.store = store
-        self.projections = {p.name: p for p in projections}
-        self.batch_size = batch_size
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay_ms / 1000
+        self._projections = {p.name: p for p in projections}
+        self._async_projections = {
+            name: p for name, p in self._projections.items() 
+            if isinstance(p, AsyncProjection)
+        }
         self._running = False
-        self._task: Optional[asyncio.Task] = None
         self._checkpoints: Dict[str, int] = {}
-        self._failed_events: Dict[str, Dict[str, int]] = {}  # projection_name -> event_id -> retry_count
+        self._max_retries = max_retries
+        self._batch_size = batch_size
+        self._poll_interval_ms = poll_interval_ms
+        self._dead_letter_queue_enabled = dead_letter_queue_enabled
+        self._dead_letter_queue: List[Dict[str, Any]] = []
+        self._stats = {
+            "total_processed": 0,
+            "total_errors": 0,
+            "last_processed_at": None,
+            "last_error_at": None
+        }
     
-    async def start(self):
-        """Start the daemon."""
-        if self._running:
-            return
+    async def run_forever(self) -> None:
+        """Run the daemon continuously"""
+        self._running = True
+        logger.info(f"Projection daemon started with {len(self._async_projections)} async projections")
         
-        # Load checkpoints
+        # Load initial checkpoints
         await self._load_checkpoints()
         
-        self._running = True
-        self._task = asyncio.create_task(self._run_forever())
-        logger.info("Projection daemon started")
-    
-    async def stop(self):
-        """Stop the daemon gracefully."""
-        self._running = False
-        if self._task:
-            self._task.cancel()
+        while self._running:
             try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+                await self._process_batch()
+            except Exception as e:
+                logger.error(f"Error processing batch: {e}", exc_info=True)
+                self._stats["total_errors"] += 1
+                self._stats["last_error_at"] = datetime.utcnow()
+            
+            await asyncio.sleep(self._poll_interval_ms / 1000)
+        
         logger.info("Projection daemon stopped")
     
-    async def _load_checkpoints(self):
-        """Load checkpoints from database."""
+    async def _load_checkpoints(self) -> None:
+        """Load checkpoints from database"""
         async with self.store.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT projection_name, last_position FROM projection_checkpoints"
-            )
-            for row in rows:
-                self._checkpoints[row["projection_name"]] = row["last_position"]
+            for projection_name in self._async_projections:
+                row = await conn.fetchrow("""
+                    SELECT last_position FROM projection_checkpoints
+                    WHERE projection_name = $1
+                """, projection_name)
+                
+                self._checkpoints[projection_name] = row['last_position'] if row else 0
+                logger.debug(f"Loaded checkpoint for {projection_name}: {self._checkpoints[projection_name]}")
     
-    async def _update_checkpoint(self, projection_name: str, position: int):
-        """Update checkpoint for a projection."""
+    async def _save_checkpoint(self, projection_name: str, position: int) -> None:
+        """Save checkpoint to database"""
         async with self.store.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO projection_checkpoints (projection_name, last_position, updated_at)
                 VALUES ($1, $2, NOW())
-                ON CONFLICT (projection_name)
-                DO UPDATE SET last_position = $2, updated_at = NOW()
+                ON CONFLICT (projection_name) 
+                DO UPDATE SET last_position = EXCLUDED.last_position, updated_at = NOW()
             """, projection_name, position)
         
         self._checkpoints[projection_name] = position
+        logger.debug(f"Saved checkpoint for {projection_name}: {position}")
     
-    async def _run_forever(self):
-        """Main daemon loop."""
-        while self._running:
-            try:
-                await self._process_batch()
-                await asyncio.sleep(0.1)  # 100ms polling interval
-            except Exception as e:
-                logger.error(f"Error in projection daemon: {e}")
-                await asyncio.sleep(1)
-    
-    async def _process_batch(self):
-        """Process a batch of events."""
-        # Get lowest checkpoint across all projections
-        min_position = min(self._checkpoints.values()) if self._checkpoints else 0
+    async def _process_batch(self) -> None:
+        """Process a batch of events for all async projections"""
+        if not self._async_projections:
+            return
+        
+        # Find minimum checkpoint across all async projections
+        min_position = min(self._checkpoints.values())
         
         # Get current global position
-        current_global = await self.store.get_global_position()
+        async with self.store.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT MAX(global_position) FROM events")
+            current_position = row[0] or 0
         
-        if min_position >= current_global:
+        if min_position >= current_position:
+            # No new events
             return
         
         # Load events from min_position
+        events_batch = []
         async for batch in self.store.load_all(
-            from_global_position=min_position + 1,
-            batch_size=self.batch_size
+            from_global_position=min_position,
+            batch_size=self._batch_size
         ):
-            # Process each event
-            for event in batch:
-                for projection_name, projection in self.projections.items():
-                    if projection.should_process(event):
-                        await self._process_event_for_projection(
-                            projection_name,
-                            projection,
-                            event
-                        )
-            
-            # Update checkpoints after batch
-            if batch:
-                last_position = batch[-1].global_position
-                for projection_name in self.projections:
-                    await self._update_checkpoint(projection_name, last_position)
-    
-    async def _process_event_for_projection(
-        self,
-        projection_name: str,
-        projection: Projection,
-        event
-    ):
-        """Process an event for a specific projection with retry logic."""
-        event_id = str(event.event_id)
-        retry_key = f"{projection_name}:{event_id}"
+            events_batch = batch
+            break
         
-        for attempt in range(self.max_retries):
+        if not events_batch:
+            return
+        
+        logger.debug(f"Processing batch of {len(events_batch)} events from position {min_position}")
+        
+        # Process each event through all async projections
+        for projection_name, projection in self._async_projections.items():
+            checkpoint = self._checkpoints[projection_name]
+            
+            # Filter events after checkpoint for this projection
+            events_to_process = [
+                e for e in events_batch 
+                if e.global_position > checkpoint
+            ]
+            
+            if not events_to_process:
+                continue
+            
+            await self._process_events_for_projection(
+                projection_name, 
+                projection, 
+                events_to_process
+            )
+            
+            # Update checkpoint to last processed event
+            last_position = events_to_process[-1].global_position
+            await self._save_checkpoint(projection_name, last_position)
+        
+        # Update stats
+        self._stats["total_processed"] += len(events_batch)
+        self._stats["last_processed_at"] = datetime.utcnow()
+        
+        # Update lag metrics
+        for projection_name, projection in self._async_projections.items():
+            await projection.update_lag(current_position)
+    
+    async def _process_events_for_projection(
+        self, 
+        projection_name: str, 
+        projection: AsyncProjection,
+        events: List[StoredEvent]
+    ) -> None:
+        """Process a batch of events for a projection with retries"""
+        for attempt in range(self._max_retries):
             try:
-                await projection.process(event)
+                await projection.handle_batch(events)
                 return
             except Exception as e:
                 logger.warning(
-                    f"Failed to process event {event_id} for projection {projection_name}: {e}"
+                    f"Error processing {len(events)} events for projection {projection_name}, "
+                    f"attempt {attempt + 1}/{self._max_retries}: {e}"
                 )
                 
-                if attempt == self.max_retries - 1:
-                    # Last attempt failed
+                if attempt == self._max_retries - 1:
+                    # Final attempt failed
                     logger.error(
-                        f"Permanent failure for event {event_id} in projection {projection_name}"
+                        f"Failed to process {len(events)} events for projection {projection_name} "
+                        f"after {self._max_retries} attempts"
                     )
-                    raise ProjectionError(projection_name, event_id, str(e))
-                
-                await asyncio.sleep(self.retry_delay * (attempt + 1))
+                    
+                    if self._dead_letter_queue_enabled:
+                        # Send to dead letter queue
+                        self._dead_letter_queue.append({
+                            "projection": projection_name,
+                            "events": [e.dict() for e in events],
+                            "error": str(e),
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                        logger.warning(f"Added {len(events)} events to dead letter queue")
+                else:
+                    # Exponential backoff with jitter
+                    delay = (0.1 * (2 ** attempt)) + (0.01 * attempt)
+                    await asyncio.sleep(delay)
     
-    def get_lag(self) -> Dict[str, int]:
-        """
-        Get lag for each projection.
+    async def rebuild_projection(self, projection_name: str) -> None:
+        """Rebuild a specific projection from scratch"""
+        if projection_name not in self._async_projections:
+            raise ValueError(f"Unknown projection: {projection_name}")
         
-        Returns:
-            Dict mapping projection name to lag (number of events behind)
-        """
-        current_global = asyncio.run_coroutine_threadsafe(
-            self.store.get_global_position(),
-            asyncio.get_event_loop()
-        ).result()
+        projection = self._async_projections[projection_name]
+        logger.info(f"Rebuilding projection {projection_name}")
         
+        await projection.rebuild(self.store)
+        await self._save_checkpoint(projection_name, await self._get_current_global_position())
+        
+        logger.info(f"Rebuilt projection {projection_name}")
+    
+    async def rebuild_all_projections(self) -> None:
+        """Rebuild all async projections from scratch"""
+        for projection_name in self._async_projections:
+            await self.rebuild_projection(projection_name)
+    
+    async def get_lag(self, projection_name: str) -> Dict[str, Any]:
+        """Get lag metrics for a specific projection"""
+        if projection_name not in self._async_projections:
+            return {"error": f"Unknown projection: {projection_name}"}
+        
+        projection = self._async_projections[projection_name]
+        return projection.get_lag()
+    
+    async def get_all_lags(self) -> Dict[str, Any]:
+        """Get lag metrics for all projections"""
+        current_position = await self._get_current_global_position()
         lags = {}
-        for name, checkpoint in self._checkpoints.items():
-            lags[name] = current_global - checkpoint
+        
+        for name, projection in self._async_projections.items():
+            await projection.update_lag(current_position)
+            lags[name] = projection.get_lag()
         
         return lags
     
-    async def rebuild_projection(self, projection_name: str):
-        """
-        Rebuild a projection from scratch by replaying all events.
+    async def get_dead_letter_queue(self) -> List[Dict[str, Any]]:
+        """Get the dead letter queue contents"""
+        return self._dead_letter_queue
+    
+    async def clear_dead_letter_queue(self) -> None:
+        """Clear the dead letter queue"""
+        self._dead_letter_queue = []
+        logger.info("Dead letter queue cleared")
+    
+    async def reprocess_dead_letter(self) -> None:
+        """Reprocess events from dead letter queue"""
+        if not self._dead_letter_queue:
+            return
         
-        Args:
-            projection_name: Name of projection to rebuild
-        """
-        if projection_name not in self.projections:
-            raise ValueError(f"Unknown projection: {projection_name}")
+        logger.info(f"Reprocessing {len(self._dead_letter_queue)} dead letter entries")
         
-        logger.info(f"Rebuilding projection {projection_name}")
+        for entry in self._dead_letter_queue:
+            projection = self._async_projections.get(entry["projection"])
+            if projection:
+                events = [StoredEvent(**e) for e in entry["events"]]
+                try:
+                    await projection.handle_batch(events)
+                    logger.info(f"Reprocessed {len(events)} events for {entry['projection']}")
+                except Exception as e:
+                    logger.error(f"Failed to reprocess events: {e}")
         
-        # Clear existing data for this projection
-        projection = self.projections[projection_name]
-        await projection.clear()
-        
-        # Reset checkpoint
-        await self._update_checkpoint(projection_name, 0)
-        
-        # Replay all events
-        async for batch in self.store.load_all(batch_size=1000):
-            for event in batch:
-                if projection.should_process(event):
-                    try:
-                        await projection.process(event)
-                    except Exception as e:
-                        logger.error(f"Error rebuilding projection {projection_name}: {e}")
-                        raise
-        
-        logger.info(f"Rebuilt projection {projection_name}")
+        self._dead_letter_queue = []
+    
+    async def _get_current_global_position(self) -> int:
+        """Get current global position from events table"""
+        async with self.store.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT MAX(global_position) FROM events")
+            return row[0] or 0
+    
+    def stop(self) -> None:
+        """Stop the daemon"""
+        self._running = False
+        logger.info("Projection daemon stop requested")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get daemon statistics"""
+        return {
+            **self._stats,
+            "running": self._running,
+            "projections": len(self._async_projections),
+            "checkpoints": self._checkpoints,
+            "dead_letter_size": len(self._dead_letter_queue)
+        }

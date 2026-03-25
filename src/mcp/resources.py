@@ -1,15 +1,20 @@
 # src/mcp/resources.py
 """
 Complete MCP Resources Implementation - Query Side
-All 6 resources reading from projections with SLOs.
+All 6 resources reading from projections with SLOs and temporal queries.
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+import json
+import logging
 from src.event_store import EventStore
 from src.integrity.gas_town import reconstruct_agent_context
 from src.projections.daemon import ProjectionDaemon
 from src.aggregates.compliance_record import ComplianceRecordAggregate
 from src.aggregates.audit_ledger import AuditLedgerAggregate
+
+logger = logging.getLogger(__name__)
 
 
 class MCPResources:
@@ -22,71 +27,121 @@ class MCPResources:
     - Support temporal queries where applicable
     """
     
-    def __init__(self, store: EventStore):
+    def __init__(self, store: EventStore, daemon: Optional[ProjectionDaemon] = None):
         self.store = store
-        self.daemon: Optional[ProjectionDaemon] = None
+        self.daemon = daemon
+        self._cache: Dict[str, Any] = {}
+        self._cache_ttl: Dict[str, datetime] = {}
+        self._stats = {
+            "total_queries": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "query_times_ms": []
+        }
     
     async def get_resource(self, uri: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
         """Get a resource by URI"""
         
-        # Parse URI: ledger://applications/{id}
-        if uri.startswith("ledger://applications/"):
-            parts = uri.replace("ledger://applications/", "").split("/")
-            application_id = parts[0]
+        start_time = datetime.utcnow()
+        self._stats["total_queries"] += 1
+        
+        try:
+            # Check cache for GET requests without temporal parameters
+            cache_key = f"{uri}:{json.dumps(parameters or {}, sort_keys=True)}"
+            if parameters is None or "as_of" not in parameters:
+                if cache_key in self._cache:
+                    cached_time = self._cache_ttl.get(cache_key)
+                    if cached_time and (datetime.utcnow() - cached_time).total_seconds() < 60:
+                        self._stats["cache_hits"] += 1
+                        return self._cache[cache_key]
             
-            if len(parts) == 1:
-                # ledger://applications/{id}
-                # SLO: p99 < 50ms
-                return await self.get_application_summary(application_id)
+            self._stats["cache_misses"] += 1
+            
+            # Parse URI and route
+            if uri.startswith("ledger://applications/"):
+                parts = uri.replace("ledger://applications/", "").split("/")
+                application_id = parts[0]
                 
-            elif len(parts) == 2 and parts[1] == "compliance":
-                # ledger://applications/{id}/compliance
-                # SLO: p99 < 200ms
-                as_of = parameters.get("as_of") if parameters else None
-                return await self.get_compliance_audit(application_id, as_of)
+                if len(parts) == 1:
+                    # ledger://applications/{id}
+                    # SLO: p99 < 50ms
+                    result = await self.get_application_summary(application_id)
+                    
+                elif len(parts) == 2 and parts[1] == "compliance":
+                    # ledger://applications/{id}/compliance
+                    # SLO: p99 < 200ms
+                    as_of = parameters.get("as_of") if parameters else None
+                    result = await self.get_compliance_audit(application_id, as_of)
+                    
+                elif len(parts) == 2 and parts[1] == "audit-trail":
+                    # ledger://applications/{id}/audit-trail
+                    # SLO: p99 < 500ms
+                    from_pos = parameters.get("from") if parameters else None
+                    to_pos = parameters.get("to") if parameters else None
+                    result = await self.get_audit_trail(application_id, from_pos, to_pos)
                 
-            elif len(parts) == 2 and parts[1] == "audit-trail":
-                # ledger://applications/{id}/audit-trail
-                # SLO: p99 < 500ms
-                from_pos = parameters.get("from") if parameters else None
-                to_pos = parameters.get("to") if parameters else None
-                return await self.get_audit_trail(application_id, from_pos, to_pos)
-            
-            elif len(parts) == 2 and parts[1] == "status":
-                # ledger://applications/{id}/status
-                # SLO: p99 < 30ms
-                return await self.get_application_status(application_id)
-        
-        elif uri.startswith("ledger://agents/"):
-            parts = uri.replace("ledger://agents/", "").split("/")
-            agent_id = parts[0]
-            
-            if len(parts) == 2 and parts[1] == "performance":
-                # ledger://agents/{id}/performance
-                # SLO: p99 < 50ms
-                return await self.get_agent_performance(agent_id)
+                elif len(parts) == 2 and parts[1] == "status":
+                    # ledger://applications/{id}/status
+                    # SLO: p99 < 30ms
+                    result = await self.get_application_status(application_id)
                 
-            elif len(parts) == 3 and parts[1] == "sessions":
-                # ledger://agents/{id}/sessions/{session_id}
-                # SLO: p99 < 300ms
-                session_id = parts[2]
-                return await self.get_agent_session(agent_id, session_id, parameters)
-        
-        elif uri.startswith("ledger://compliance/"):
-            parts = uri.replace("ledger://compliance/", "").split("/")
-            application_id = parts[0]
+                else:
+                    raise ValueError(f"Unknown resource URI: {uri}")
             
-            if len(parts) == 2 and parts[1] == "summary":
-                # ledger://compliance/{id}/summary
-                # SLO: p99 < 100ms
-                return await self.get_compliance_summary(application_id)
-        
-        elif uri == "ledger://ledger/health":
-            # ledger://ledger/health
-            # SLO: p99 < 10ms
-            return await self.get_health()
-        
-        raise ValueError(f"Unknown resource URI: {uri}")
+            elif uri.startswith("ledger://agents/"):
+                parts = uri.replace("ledger://agents/", "").split("/")
+                agent_id = parts[0]
+                
+                if len(parts) == 2 and parts[1] == "performance":
+                    # ledger://agents/{id}/performance
+                    # SLO: p99 < 50ms
+                    result = await self.get_agent_performance(agent_id)
+                    
+                elif len(parts) == 3 and parts[1] == "sessions":
+                    # ledger://agents/{id}/sessions/{session_id}
+                    # SLO: p99 < 300ms
+                    session_id = parts[2]
+                    result = await self.get_agent_session(agent_id, session_id, parameters)
+                
+                else:
+                    raise ValueError(f"Unknown resource URI: {uri}")
+            
+            elif uri.startswith("ledger://compliance/"):
+                parts = uri.replace("ledger://compliance/", "").split("/")
+                application_id = parts[0]
+                
+                if len(parts) == 2 and parts[1] == "summary":
+                    # ledger://compliance/{id}/summary
+                    # SLO: p99 < 100ms
+                    result = await self.get_compliance_summary(application_id)
+                
+                else:
+                    raise ValueError(f"Unknown resource URI: {uri}")
+            
+            elif uri == "ledger://ledger/health":
+                # ledger://ledger/health
+                # SLO: p99 < 10ms
+                result = await self.get_health()
+            
+            else:
+                raise ValueError(f"Unknown resource URI: {uri}")
+            
+            # Cache result
+            if cache_key and "as_of" not in (parameters or {}):
+                self._cache[cache_key] = result
+                self._cache_ttl[cache_key] = datetime.utcnow()
+            
+            # Record query time
+            elapsed_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+            self._stats["query_times_ms"].append(elapsed_ms)
+            if len(self._stats["query_times_ms"]) > 1000:
+                self._stats["query_times_ms"] = self._stats["query_times_ms"][-1000:]
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Resource query failed for {uri}: {e}", exc_info=True)
+            raise
     
     async def get_application_summary(self, application_id: str) -> Dict[str, Any]:
         """
@@ -134,13 +189,15 @@ class MCPResources:
         """
         if as_of:
             # Temporal query: get state as it existed at a point in time
+            as_of_dt = datetime.fromisoformat(as_of)
+            
             async with self.store.pool.acquire() as conn:
                 row = await conn.fetchrow("""
                     SELECT snapshot_data FROM compliance_audit_snapshots
                     WHERE application_id = $1 AND snapshot_timestamp <= $2
                     ORDER BY snapshot_timestamp DESC
                     LIMIT 1
-                """, application_id, as_of)
+                """, application_id, as_of_dt)
                 
                 if row:
                     return row['snapshot_data']
@@ -276,13 +333,16 @@ class MCPResources:
                 lag = current_position - row['last_position']
                 lags[row['projection_name']] = {
                     "lag_events": lag,
-                    "lag_estimated_ms": lag * 0.5,  # Rough estimate
+                    "lag_estimated_ms": lag * 0.5,
                     "last_updated": row['updated_at'].isoformat()
                 }
             
             # Get aggregate counts
             app_count = await conn.fetchval("SELECT COUNT(*) FROM application_summary")
             agent_count = await conn.fetchval("SELECT COUNT(DISTINCT agent_id) FROM agent_performance")
+            
+            # Get daemon stats if available
+            daemon_stats = self.daemon.get_stats() if self.daemon else {}
             
             return {
                 "status": "healthy",
@@ -293,9 +353,29 @@ class MCPResources:
                     "agents": agent_count,
                     "total_events": current_position
                 },
+                "daemon": daemon_stats,
                 "slo_status": {
                     "application_summary": "OK" if lags.get("application_summary", {}).get("lag_events", 0) < 100 else "WARNING",
                     "agent_performance": "OK" if lags.get("agent_performance", {}).get("lag_events", 0) < 500 else "WARNING",
                     "compliance_audit": "OK" if lags.get("compliance_audit", {}).get("lag_events", 0) < 1000 else "WARNING"
                 }
             }
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get resource query statistics"""
+        avg_time = sum(self._stats["query_times_ms"]) / len(self._stats["query_times_ms"]) if self._stats["query_times_ms"] else 0
+        p95_time = sorted(self._stats["query_times_ms"])[int(len(self._stats["query_times_ms"]) * 0.95)] if self._stats["query_times_ms"] else 0
+        
+        return {
+            **self._stats,
+            "cache_hit_rate": (self._stats["cache_hits"] / self._stats["total_queries"] * 100) if self._stats["total_queries"] > 0 else 0,
+            "avg_query_time_ms": avg_time,
+            "p95_query_time_ms": p95_time,
+            "cache_size": len(self._cache)
+        }
+    
+    def clear_cache(self) -> None:
+        """Clear the resource cache"""
+        self._cache.clear()
+        self._cache_ttl.clear()
+        logger.info("Resource cache cleared")

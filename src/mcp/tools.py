@@ -5,11 +5,12 @@ All 8 tools with precondition documentation and structured errors.
 """
 
 from typing import Dict, Any, Optional, List
+import logging
 from src.commands.handlers import CommandHandlers
-from src.models.errors import PreconditionFailedError, OptimisticConcurrencyError
+from src.models.errors import PreconditionFailedError, OptimisticConcurrencyError, DomainError
 from src.integrity.audit_chain import run_integrity_check
-from src.aggregates.compliance_record import ComplianceRecordAggregate
-from src.aggregates.audit_ledger import AuditLedgerAggregate
+
+logger = logging.getLogger(__name__)
 
 
 class MCPTools:
@@ -20,33 +21,63 @@ class MCPTools:
     - Precondition documentation in docstring for LLM consumption
     - Structured error types with suggested_action
     - Correlation ID tracing
+    - Input validation
     """
     
     def __init__(self, command_handlers: CommandHandlers):
         self.handlers = command_handlers
+        self._stats = {
+            "total_calls": 0,
+            "successful_calls": 0,
+            "failed_calls": 0,
+            "calls_by_tool": {}
+        }
     
     async def execute_tool(self, tool_name: str, arguments: Dict[str, Any], 
                           correlation_id: Optional[str] = None) -> Dict[str, Any]:
         """Execute the requested tool with validation"""
         
+        self._stats["total_calls"] += 1
+        self._stats["calls_by_tool"][tool_name] = self._stats["calls_by_tool"].get(tool_name, 0) + 1
+        
         tool_method = getattr(self, f"tool_{tool_name}", None)
         if not tool_method:
+            self._stats["failed_calls"] += 1
             raise ValueError(f"Unknown tool: {tool_name}")
         
         try:
-            return await tool_method(arguments, correlation_id)
-        except PreconditionFailedError as e:
+            result = await tool_method(arguments, correlation_id)
+            self._stats["successful_calls"] += 1
+            return result
+        except (PreconditionFailedError, OptimisticConcurrencyError, DomainError) as e:
+            self._stats["failed_calls"] += 1
+            logger.warning(f"Tool {tool_name} failed: {e}")
             return {
                 "success": False,
                 "error": e.to_dict(),
-                "suggested_next_steps": [e.details.get("suggested_action", "Check preconditions")]
+                "suggested_next_steps": self._get_suggested_steps(tool_name, e)
             }
-        except OptimisticConcurrencyError as e:
+        except Exception as e:
+            self._stats["failed_calls"] += 1
+            logger.error(f"Tool {tool_name} failed with unexpected error: {e}", exc_info=True)
             return {
                 "success": False,
-                "error": e.to_dict(),
-                "suggested_next_steps": ["reload_stream_and_retry"]
+                "error": {
+                    "type": "InternalError",
+                    "message": str(e),
+                    "suggested_action": "Contact system administrator"
+                }
             }
+    
+    def _get_suggested_steps(self, tool_name: str, error: Exception) -> List[str]:
+        """Get suggested next steps based on error type"""
+        if isinstance(error, PreconditionFailedError):
+            return ["Check preconditions", error.details.get("suggested_action", "Review documentation")]
+        elif isinstance(error, OptimisticConcurrencyError):
+            return ["reload_stream_and_retry", "Use exponential backoff"]
+        elif isinstance(error, DomainError):
+            return ["Review business rules", "Check application state"]
+        return ["Contact support"]
     
     async def tool_submit_application(self, args: Dict[str, Any], 
                                       correlation_id: Optional[str]) -> Dict[str, Any]:
@@ -151,7 +182,7 @@ class MCPTools:
             confidence_score: Optional confidence score for the analysis
         
         Returns:
-            Dict with event_id and new_stream_version
+            Dict with event_type and message
         """
         await self.handlers.handle_credit_analysis_completed(
             application_id=args["application_id"],
@@ -168,6 +199,8 @@ class MCPTools:
         return {
             "success": True,
             "event_type": "CreditAnalysisCompleted",
+            "risk_tier": args["risk_tier"],
+            "credit_score": args["credit_score"],
             "message": f"Credit analysis recorded for {args['application_id']}"
         }
     
@@ -190,9 +223,12 @@ class MCPTools:
             risk_indicators: Additional risk details
         
         Returns:
-            Dict with check status
+            Dict with fraud_score and risk_level
         """
         from src.models.events import FraudScreeningCompleted
+        
+        if args["fraud_score"] < 0.0 or args["fraud_score"] > 1.0:
+            raise ValueError(f"Fraud score {args['fraud_score']} must be between 0.0 and 1.0")
         
         event = FraudScreeningCompleted(
             application_id=args["application_id"],
@@ -211,10 +247,12 @@ class MCPTools:
             correlation_id=correlation_id
         )
         
+        risk_level = "HIGH" if args["fraud_score"] > 0.7 else "MEDIUM" if args["fraud_score"] > 0.3 else "LOW"
+        
         return {
             "success": True,
             "fraud_score": args["fraud_score"],
-            "risk_level": "HIGH" if args["fraud_score"] > 0.7 else "MEDIUM" if args["fraud_score"] > 0.3 else "LOW",
+            "risk_level": risk_level,
             "message": f"Fraud screening recorded for {args['application_id']}"
         }
     
@@ -263,15 +301,10 @@ class MCPTools:
         stream_id = f"compliance-{args['application_id']}"
         version = await self.handlers.store.stream_version(stream_id)
         
-        if version == 0:
-            expected = -1
-        else:
-            expected = version
-        
         await self.handlers.store.append(
             stream_id,
             [event],
-            expected_version=expected,
+            expected_version=version if version > 0 else -1,
             correlation_id=correlation_id
         )
         
@@ -318,14 +351,17 @@ class MCPTools:
         )
         
         final_recommendation = args["orchestrator_recommendation"]
+        confidence_floor_applied = False
+        
         if args["orchestrator_confidence"] < 0.6:
             final_recommendation = "REFER"
+            confidence_floor_applied = True
         
         return {
             "success": True,
             "decision_id": f"dec-{args['application_id']}",
             "final_recommendation": final_recommendation,
-            "confidence_floor_applied": args["orchestrator_confidence"] < 0.6,
+            "confidence_floor_applied": confidence_floor_applied,
             "message": f"Decision generated for {args['application_id']}"
         }
     
@@ -398,56 +434,10 @@ class MCPTools:
             "message": f"Integrity check completed for {args['entity_type']}-{args['entity_id']}"
         }
     
-    async def tool_get_compliance_status(self, args: Dict[str, Any],
-                                        correlation_id: Optional[str]) -> Dict[str, Any]:
-        """
-        Get compliance status for an application.
-        
-        PRECONDITIONS:
-        - Application must exist
-        - Compliance record must exist
-        
-        Args:
-            application_id: Application identifier
-        
-        Returns:
-            Dict with compliance status and details
-        """
-        compliance = await ComplianceRecordAggregate.load(
-            self.handlers.store,
-            args["application_id"]
-        )
-        
+    def get_stats(self) -> Dict[str, Any]:
+        """Get tool statistics"""
         return {
-            "success": True,
-            "status": compliance.status,
-            "summary": compliance.get_compliance_summary()
-        }
-    
-    async def tool_get_audit_trail(self, args: Dict[str, Any],
-                                   correlation_id: Optional[str]) -> Dict[str, Any]:
-        """
-        Get audit trail for an entity.
-        
-        PRECONDITIONS:
-        - Entity must exist
-        - Auditor permissions required
-        
-        Args:
-            entity_type: Type of entity (loan, agent, compliance)
-            entity_id: Entity identifier
-        
-        Returns:
-            Dict with audit trail and integrity report
-        """
-        audit = await AuditLedgerAggregate.load(
-            self.handlers.store,
-            args["entity_type"],
-            args["entity_id"]
-        )
-        
-        return {
-            "success": True,
-            "audit_trail": audit.get_audit_trail(),
-            "integrity_report": audit.get_integrity_report()
+            **self._stats,
+            "success_rate": (self._stats["successful_calls"] / self._stats["total_calls"] * 100) 
+                            if self._stats["total_calls"] > 0 else 0
         }
