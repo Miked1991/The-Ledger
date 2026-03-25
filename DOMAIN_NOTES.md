@@ -1,508 +1,462 @@
+
 # DOMAIN_NOTES.md
 
-## Agentic Event Store for Apex Financial Services
-
-## TRP1 Week 5 Challenge | The Ledger
+```markdown
+# DOMAIN_NOTES.md - Domain Analysis & Architecture Decisions
 
 ## 1. EDA vs. ES Distinction
 
 ### Question
+A component uses callbacks (like LangChain traces) to capture event-like data. Is this Event-Driven Architecture (EDA) or Event Sourcing (ES)? If you redesigned it using The Ledger, what exactly would change in the architecture and what would you gain?
 
-A component uses callbacks (like LangChain traces) to capture event-like data. Is this Event-Driven Architecture (EDA) or Event Sourcing (ES)?
+### Answer
+This is **Event-Driven Architecture (EDA)**, not Event Sourcing.
 
-### Answer: Event-Driven Architecture (EDA)
-
-### Core Distinction
+### Comparison Table
 
 ```markdown
-| Aspect | EDA (LangChain Traces) | Event Sourcing (The Ledger) |
-|--------|------------------------|----------------------------|
-| Primary Purpose | Notify subscribers about events | Events ARE the source of truth |
-| Persistence | Optional, often volatile | Immutable, ACID-guaranteed |
-| State Reconstruction | Impossible from events alone | Complete replay capability |
-| Crash Recovery | Context lost forever | Full context reconstruction |
-| Audit Trail | Best-effort logging | Cryptographic proof |
-| Query Capability | Log inspection only | Temporal queries, projections |
+| Aspect | Event-Driven Architecture (EDA) | Event Sourcing (ES) |
+|--------|--------------------------------|---------------------|
+| **Events Role** | Notifications, can be lost | Source of truth, cannot be lost |
+| **Storage** | Logs, traces, ephemeral | Persistent, append-only |
+| **State** | In-memory only | Rebuilt from events |
+| **Ordering** | Not guaranteed | Guaranteed per stream |
+| **Replay** | Not possible | Full replay capability |
+| **Transactions** | Fire-and-forget | Atomic with concurrency control |
+| **Recovery** | Context lost on crash | Gas Town pattern reconstruction |
 ```
 
-### What Changes with The Ledger
+## Redesign Changes
 
 ```mermaid
-graph TB
-    subgraph "Current: EDA with LangChain"
-        A1[AI Agent] --> A2[LangChain Callback]
-        A2 --> A3[Log File]
-        A3 --> A4[Grafana]
-        A3 -.->|Lost on restart| A5[(No Recovery)]
+graph LR
+    subgraph "EDA Current State"
+        A[Agent] -->|Callback| B[Logger]
+        A -->|Direct| C[State]
+        C -->|Lost on crash| D[Memory]
     end
     
-    subgraph "New: Event Sourcing with The Ledger"
-        B1[AI Agent] --> B2[Command Handler]
-        B2 --> B3[(Event Store<br/>PostgreSQL)]
-        B3 --> B4[Projections]
-        B3 --> B5[Audit Trail]
-        B3 -->|Replay on crash| B6[Full Recovery]
+    subgraph "ES The Ledger"
+        E[Agent] -->|Command| F[Event Store]
+        F -->|Append| G[(PostgreSQL)]
+        G -->|Replay| H[Aggregate]
+        H -->|Rebuild| I[State]
+        J[Projection] -->|Read| G
     end
 ```
 
 ### What We Gain
 
 ```markdown
-| Gain | Before | After |
-|------|--------|-------|
-| Auditability | "The log says X" | "Here's the signed event with hash chain" |
-| Recoverability | Start from scratch on crash | Resume exactly where left off |
-| Temporal Queries | Impossible | "Show me state on March 15" |
-| Regulatory Compliance | Scattered logs | Complete decision provenance |
-| Business Rules | Best-effort UI validation | Enforced atomically with events |
+| Gain | Description |
+|------|-------------|
+| **Auditability** | Complete, immutable record of every decision |
+| **Reproducibility** | Can replay events to recreate any past state |
+| **Debugging** | Temporal queries reveal exactly what happened |
+| **Governance** | Regulatory compliance with cryptographic integrity |
+| **Resilience** | Gas Town pattern prevents memory loss on crashes |
 ```
 
-## 2. Aggregate Boundary Decisions
+## 2. Aggregate Boundary Analysis
+
+### Question
+
+In the scenario below, you will build four aggregates. Identify one alternative boundary you considered and rejected. What coupling problem does your chosen boundary prevent?
 
 ### The Four Aggregates
 
 ```markdown
-| Aggregate | Stream ID | What It Tracks |
-|-----------|-----------|----------------|
-|LoanApplication | `loan-{id}` | Full loan lifecycle, state machine |
-|AgentSession | `agent-{id}-{session}` | AI agent context, Gas Town pattern |
-|ComplianceRecord | `compliance-{id}` | Regulatory checks, rule versions |
-|AuditLedger | `audit-{entity}-{id}` | Cross-cutting audit trail |
+| Aggregate | Stream ID Format | Purpose |
+|-----------|-----------------|---------|
+| **LoanApplication** | `loan-{application_id}` | Full lifecycle of commercial loan application |
+| **AgentSession** | `agent-{agent_id}-{session_id}` | All actions taken by a specific AI agent |
+| **ComplianceRecord** | `compliance-{application_id}` | Regulatory checks and compliance verdicts |
+| **AuditLedger** | `audit-{entity_type}-{entity_id}` | Cross-cutting audit trail linking events |
 ```
 
-### Alternative Boundary Considered and Rejected
+### Alternative Boundary Considered: Merged LoanApplication + ComplianceRecord
 
-**Option:** Merge `ComplianceRecord` into `LoanApplication`
+**Why Considered:**
 
-### Why We Considered It
+- Simpler implementation with fewer aggregates
+- Easier consistency enforcement
+- Single stream for all application-related data
 
-- Simpler implementation (fewer aggregates)
-- Easier to enforce "compliance must pass before approval"
-- Less stream management overhead
-
-### Why We Rejected It
-
-**The Coupling Problem:** Independent business capabilities become serialized
-
-```mermaid
-sequenceDiagram
-    participant Credit as Credit Agent
-    participant Loan as Loan Stream
-    participant Compliance as Compliance Agent
-    
-    Note over Loan: Version = 5
-    
-    Credit->>Loan: Load (version 5)
-    Compliance->>Loan: Load (version 5)
-    
-    Credit->>Loan: Append event
-    Loan-->>Credit: Version = 6
-    
-    Compliance->>Loan: Append with expected_version=5
-    Loan-->>Compliance: ❌ Concurrency Error
-    
-    Note over Compliance: Compliance fails because<br/>credit completed first!
-```
-
-### What Chosen Boundary Prevents
+**Why Rejected:**
 
 ```markdown
-| Problem | Merged Aggregate | Separate Aggregates |
-|---------|-----------------|---------------------|
-| **Write Contention** | All operations lock loan stream | Compliance on own stream |
-| **Team Independence** | Compliance blocks loan processing | Teams work in parallel |
-| **Recovery Scope** | Replay entire loan history | Compliance stream independent |
-| **Business Coupling** | Loan logic tied to regulatory rules | Each domain evolves separately |
+| Problem | Description | Failure Mode |
+|---------|-------------|--------------|
+| **Concurrency Bottleneck** | All agents compete for same stream | 4 agents × 100 apps = 400 conflicts/hour → system deadlock |
+| **Different Lifecycles** | Compliance record outlives loan | Archiving loan would archive compliance data → regulatory violation |
+| **Different Owners** | Compliance team needs independent access | Cannot grant granular permissions |
+| **Regulatory Separation** | Auditors require independent compliance trail | Cannot separate compliance from operational data |
 ```
 
-**Specific Failure Mode Prevented:** At 100 applications/hour with 4 agents each, merged design would create ~400 lock conflicts per minute. Separate aggregates eliminate this contention.
+### Coupling Problem Prevented
+
+```mermaid
+graph TD
+    subgraph "Merged Aggregate - BAD"
+        M1[Credit Agent] --> S[Single Stream<br/>loan-APP-001]
+        M2[Compliance Agent] --> S
+        M3[Fraud Agent] --> S
+        M4[Decision Agent] --> S
+        S --> C[Concurrency Conflict]
+    end
+    
+    subgraph "Separate Aggregates - GOOD"
+        L1[Credit Agent] --> LS[loan-APP-001]
+        L2[Decision Agent] --> LS
+        C1[Compliance Agent] --> CS[compliance-APP-001]
+        F1[Fraud Agent] --> AS[agent-fraud-session]
+        LS --> N[No Conflict]
+        CS --> N
+        AS --> N
+    end
+```
+
+### Concurrency Impact Calculation
+
+```markdown
+| Scenario | Writes per Stream | Conflicts per Hour | System Throughput |
+|----------|------------------|-------------------|-------------------|
+| Merged Aggregate | 400 | 400 | 0 (deadlock) |
+| Separate Aggregates | 100 per stream | ~4 | 400 writes/sec |
+```
 
 ## 3. Concurrency in Practice
 
-### Scenario
+## Question
 
-Two AI agents simultaneously process the same loan application and both call `append_events` with `expected_version=3`.
+Two AI agents simultaneously process the same loan application and both call append_events with expected_version=3. Trace the exact sequence of operations in your event store. What does the losing agent receive, and what must it do next?
 
-### Exact Sequence of Operations
+### Sequence of Operations
 
-```markdown
-| Step | Agent A | Agent B | Database |
-|------|---------|---------|----------|
-| 1 | Load stream → version 3 | Load stream → version 3 | Version = 3 |
-| 2 | Process decision logic | Process decision logic | - |
-| 3 | BEGIN TRANSACTION | BEGIN TRANSACTION (blocked) | Lock acquired |
-| 4 | Check version = 3 ✓ | Waiting | - |
-| 5 | Append event (version 4) | Waiting | - |
-| 6 | COMMIT | Waiting | Version = 4 |
-| 7 | Return success | Acquires lock | - |
-| 8 | - | Check version = 4 ✗ | Expected 3 ≠ 4 |
-| 9 | - | ROLLBACK | - |
-| 10 | - | Return `OptimisticConcurrencyError` | - |
+```mermaid
+sequenceDiagram
+    participant DB as PostgreSQL
+    participant A as Agent A
+    participant B as Agent B
+    
+    Note over A,B: Both read stream at version 3
+    
+    A->>DB: BEGIN TRANSACTION
+    A->>DB: SELECT current_version FROM streams WHERE stream_id = 'loan-APP-001'
+    DB-->>A: version = 3
+    
+    B->>DB: BEGIN TRANSACTION
+    B->>DB: SELECT current_version FROM streams WHERE stream_id = 'loan-APP-001'
+    DB-->>B: version = 3
+    
+    A->>DB: INSERT INTO events (stream_id, stream_position=4, ...)
+    A->>DB: UPDATE event_streams SET current_version = 4
+    A->>DB: COMMIT
+    
+    B->>DB: INSERT INTO events (stream_id, stream_position=4, ...)
+    DB-->>B: ERROR: duplicate key value violates unique constraint "uq_stream_position"
+    B->>DB: ROLLBACK
+    
+    Note over B: Receives OptimisticConcurrencyError
 ```
 
 ### What the Losing Agent Receives
 
-```python
-OptimisticConcurrencyError(
-    stream_id="loan-123",
-    expected_version=3,
-    actual_version=4,
-    message="Concurrency conflict on stream loan-123: expected version 3, actual 4"
-)
+```json
+{
+    "error_type": "OptimisticConcurrencyError",
+    "stream_id": "loan-APP-001",
+    "expected_version": 3,
+    "actual_version": 4,
+    "message": "Concurrency conflict on stream loan-APP-001: expected version 3, actual version 4",
+    "suggested_action": "reload_stream_and_retry"
+}
 ```
 
-### What It Must Do Next
+### What the Agent Must Do Next
 
-```mermaid
-flowchart TD
-    A[Receive ConcurrencyError] --> B[Reload stream]
-    B --> C[Get version 4 events]
-    C --> D{Re-evaluate decision<br/>with new state}
-    
-    D -->|Decision still valid| E[Retry with expected_version=4]
-    D -->|Decision invalidated| F[Abort operation]
-    
-    E --> G{Retry success?}
-    G -->|Yes| H[Complete]
-    G -->|No| I[Exponential backoff<br/>max 3 attempts]
-    I --> B
+```markdown
+| Step | Action | Code |
+|------|--------|------|
+| 1 | Catch exception | `except OptimisticConcurrencyError as e:` |
+| 2 | Reload stream | `app = await LoanApplicationAggregate.load(store, app_id)` |
+| 3 | Re-evaluate decision | `if app.credit_analysis_tier == "HIGH":` |
+| 4 | Retry with new version | `await store.append(stream_id, events, expected_version=app.version)` |
+| 5 | Exponential backoff | `await asyncio.sleep(0.1 * (2 ** attempt))` |
 ```
-
-**Critical:** The losing agent must re-evaluate, not blindly retry. If the winning agent's event invalidates its decision, it should abort.
 
 ## 4. Projection Lag and Its Consequences
 
-### Scenario
+### Question
 
-LoanApplication projection has eventual consistency with typical lag of 200ms. A loan officer queries "available credit limit" immediately after an agent commits a disbursement event. They see the old limit.
+Your LoanApplication projection is eventually consistent with a typical lag of 200ms. A loan officer queries "available credit limit" immediately after an agent commits a disbursement event. They see the old limit. What does your system do, and how do you communicate this to the user interface?
 
-### What the System Does
+### System Response Strategy
 
 ```mermaid
-flowchart LR
-    subgraph "Write Path"
-        A[Agent commits disbursement] --> B[(Event Store)]
-        B --> C[Write returns immediately]
-    end
-    
-    subgraph "Read Path"
-        D[Loan officer queries] --> E[(Projection)]
-        E --> F[Returns stale data]
-    end
-    
-    subgraph "Async Path"
-        B --> G[Async Daemon<br/>200ms lag]
-        G --> E
-    end
-    
-    F --> H[UI shows pending indicator]
-    H --> I[Auto-refresh shows new data]
+graph TD
+    A[User Query] --> B{Check Pending Events}
+    B -->|Has Pending| C[Show Optimistic Value]
+    B -->|No Pending| D[Show Current Value]
+    C --> E[Show "Updating..." Indicator]
+    C --> F[WebSocket Push Update]
+    F --> G[Refresh UI]
 ```
 
-### Communication to User Interface
-
-## Strategy 1: Optimistic UI with Pending State**
-
-```typescript
-// Frontend pattern
-const { data, isStale } = useQuery('credit-limit', fetchLimit);
-
-return (
-  <div>
-    <span>Available Credit: ${data?.limit}</span>
-    {isStale && <Spinner size="sm" />}
-    {isStale && (
-      <Alert variant="info">
-        Recent changes may take a moment to appear
-        <Button onClick={refetch}>Refresh</Button>
-      </Alert>
-    )}
-  </div>
-);
-```
-
-## Strategy 2: Last Updated Timestamp
+### User Interface Communication
 
 ```markdown
-| Element | Display |
-|---------|---------|
-| Credit Limit | $45,000 |
-| Last Updated | 2 seconds ago |
-| Status | ⟳ Updating... |
+| Component | Implementation | Purpose |
+|-----------|---------------|---------|
+| **Optimistic UI** | Show calculated value with pending transactions | User sees expected final value |
+| **Status Badge** | "Updating..." with spinning icon | Indicates eventual consistency |
+| **Progress Bar** | Show estimated 200ms wait | Sets user expectation |
+| **WebSocket** | Push update when projection catches up | Automatic refresh without user action |
+| **Timestamp** | "Last updated: 2 seconds ago" | Transparency about data freshness |
 ```
 
-## Strategy 3: Eventual Consistency Banner
+### UI Code Example
 
-```markdown
-┌─────────────────────────────────────────────┐
-│ ⓘ Data may be up to 200ms behind.          │
-│   View audit trail for confirmed state.     │
-└─────────────────────────────────────────────┘
+```html
+<div class="credit-limit-card">
+    <h3>Available Credit Limit</h3>
+    <div class="limit-value">
+        <span class="amount">${{ formatCurrency(displayLimit) }}</span>
+        <span class="status-badge {{ statusClass }}">
+            {{ statusText }}
+        </span>
+    </div>
+    <div class="pending-transactions" ng-if="pendingAmount > 0">
+        <small>Pending: ${{ formatCurrency(pendingAmount) }} in processing</small>
+        <div class="progress-bar">
+            <div class="progress" style="width: {{ progressPercent }}%"></div>
+        </div>
+        <small class="eta">Expected update in ~{{ estimatedMs }}ms</small>
+    </div>
+    <div class="last-updated">
+        Last updated: {{ lastUpdated | timeAgo }}
+    </div>
+</div>
 ```
-
-### Why Eventual Consistency is Acceptable
-
-```markdown
-| Factor | Justification |
-|--------|---------------|
-| **Human Perception** | 200ms below detection threshold |
-| **Business Process** | Loan officers expect confirmation, not instant sync |
-| **Write Throughput** | Prioritized over read consistency |
-| **Regulatory** | Regulators care about eventual correctness, not microsecond timing |
-```
-
-**Exception:** Fraud alerts and compliance holds use inline projections for immediate consistency.
 
 ## 5. The Upcasting Scenario
 
-### Event Evolution
+## Question
 
-**Version 1 (2024):**
+The CreditDecisionMade event was defined in 2024 with {application_id, decision, reason}. In 2026 it needs {application_id, decision, reason, model_version, confidence_score, regulatory_basis}. Write the upcaster. What is your inference strategy for historical events that predate model_version?
 
-```json
-{
-    "application_id": "APP-123",
-    "decision": "APPROVE",
-    "reason": "Credit score above threshold"
-}
+### Schema Evolution
+
+```markdown
+| Version | Fields | Year |
+|---------|--------|------|
+| v1 | application_id, decision, reason | 2024 |
+| v2 | application_id, decision, reason, model_version, confidence_score, regulatory_basis | 2026 |
 ```
 
-**Version 2 (2026):**
-
-```json
-{
-    "application_id": "APP-123",
-    "decision": "APPROVE",
-    "reason": "Credit score above threshold",
-    "model_version": "credit_model_v2.1",
-    "confidence_score": 0.87,
-    "regulatory_basis": "FCRA §615(a)"
-}
-```
-
-### The Upcaster
+### Upcaster Implementation
 
 ```python
 @registry.register("CreditDecisionMade", from_version=1)
-def upcast_credit_decision_v1_to_v2(payload: dict) -> dict:
+def upcast_credit_decision_v1_to_v2(payload: Dict) -> Dict:
     """
-    Transform v1 event to v2 structure.
-    Historical events never modified in storage.
+    Upcast v1 event to v2 with inference strategies.
+    
+    Inference Strategy:
+    - model_version: Infer from recorded_at timestamp
+    - confidence_score: NULL (genuinely unknown - do not fabricate)
+    - regulatory_basis: Infer from active regulations at recorded_at
     """
-    recorded_at = payload.get("recorded_at", "2024-01-01")
+    
+    # Extract timestamp from metadata
+    recorded_at = payload.get('recorded_at')
+    
+    # Model Version Inference
+    if recorded_at:
+        try:
+            date = datetime.fromisoformat(recorded_at)
+            if date.year < 2025:
+                model_version = "legacy-pre-2025"
+            elif date.year < 2026:
+                model_version = "transition-2025"
+            else:
+                model_version = "v2.0"
+        except:
+            model_version = "unknown"
+    else:
+        model_version = "unknown"
+    
+    # Regulatory Basis Inference
+    if recorded_at:
+        date = datetime.fromisoformat(recorded_at)
+        if date.year < 2024:
+            regulatory_basis = "BASEL_II_2010"
+        elif date.year < 2025:
+            regulatory_basis = "BASEL_III_2019"
+        elif date.year < 2026:
+            regulatory_basis = "BASEL_III_2024"
+        else:
+            regulatory_basis = "BASEL_III_2026"
+    else:
+        regulatory_basis = "BASEL_III_2026"
     
     return {
-        **payload,  # Preserve all original fields
-        "model_version": infer_model_version_from_date(recorded_at),
-        "confidence_score": None,  # Genuinely unknown
-        "regulatory_basis": infer_regulatory_basis_from_date(recorded_at)
+        **payload,
+        "model_version": model_version,
+        "confidence_score": None,  # DO NOT FABRICATE
+        "regulatory_basis": regulatory_basis
     }
-
-def infer_model_version_from_date(date_str: str) -> str:
-    """Date-based inference for model version."""
-    year = int(date_str[:4])
-    if year < 2025:
-        return "legacy-pre-2025"
-    elif year < 2026:
-        return "transitional-v1"
-    return "unknown"
-
-def infer_regulatory_basis_from_date(date_str: str) -> str:
-    """Look up active regulation set at given date."""
-    year = int(date_str[:4])
-    if year < 2025:
-        return "FCRA §615(a) - pre-2025 version"
-    elif year < 2026:
-        return "FCRA §615(a) - 2025 revision"
-    return "FCRA §615(a) - current version"
 ```
 
-### Inference Strategy for Historical Events
+### Inference Strategy Decision Matrix
 
 ```markdown
-| Field | Inference Strategy | Error Rate | Rationale |
-|-------|-------------------|------------|-----------|
-| **model_version** | Date-based (pre-2025 = "legacy") | ~0% | Model versions well-documented and time-correlated |
-| **confidence_score** | **NULL** (no inference) | N/A | Fabrication would violate regulatory truth requirements |
-| **regulatory_basis** | Historical regulation lookup | <1% | Regulation changes are public record |
+| Field | Inference | Error Rate | Rationale |
+|-------|-----------|------------|-----------|
+| **model_version** | Timestamp-based | 5% | Acceptable - provides useful context |
+| **confidence_score** | NULL (no inference) | 0% | Fabrication would be fraudulent |
+| **regulatory_basis** | Regulation mapping | 10% | Document inference in audit trail |
 ```
 
-### Why NULL is Better Than Fabrication
+### Why NULL Over Inference for confidence_score
 
 ```markdown
-| Consequence | Fabricating Confidence Score | Using NULL |
-|-------------|------------------------------|------------|
-| **Regulatory** | Violates SEC Rule 17a-4 | Acceptable unknown |
-| **Audit** | Detectable inconsistency | Transparent |
-| **Legal Liability** | Creates FCRA liability | No misrepresentation |
-| **Model Training** | Corrupts training data | Clean separation |
+| Reason | Explanation |
+|--------|-------------|
+| **Honesty** | Fabricating confidence scores is fraudulent |
+| **Audit Trail** | Regulators prefer "unknown" over "made up" |
+| **Model Comparison** | Cannot compare against scores that never existed |
+| **Risk** | Inferred scores could mislead risk analysis |
+| **Compliance** | Regulatory requirements mandate actual scores |
 ```
-
-**Example of Fabrication Disaster:**
-
-- Fabricate: `confidence_score = 0.75` for 2024 event
-- Auditor: "What model produced 75% confidence in 2024?"
-- Answer: "We made it up"
-- Result: Immediate compliance violation
 
 ## 6. The Marten Async Daemon Parallel
 
-### Marten 7.0 Pattern
+## Question
 
-```markdown
-Marten's Async Daemon provides distributed projection execution with:
+Marten 7.0 introduced distributed projection execution across multiple nodes. Describe how you would achieve the same pattern in your Python implementation. What coordination primitive do you use, and what failure mode does it guard against?
 
-- Multiple nodes processing projections in parallel
-- Leader election preventing duplicate processing
-- Checkpoint management across nodes
-- Fault tolerance with automatic failover
+### Python Implementation Architecture
+
+```mermaid
+graph TD
+    subgraph "Node 1 - Master"
+        M[Master Election]
+        D[Work Distributor]
+        R1[Redis Lock]
+    end
+    
+    subgraph "Node 2 - Worker"
+        W2[Worker Process]
+        H2[Heartbeat]
+        A2[Assigned Projections]
+    end
+    
+    subgraph "Node 3 - Worker"
+        W3[Worker Process]
+        H3[Heartbeat]
+        A3[Assigned Projections]
+    end
+    
+    subgraph "Coordination Layer"
+        RL[(Redis)]
+        L[Leader Key]
+        HB[Heartbeat Keys]
+        AS[Assignment Keys]
+    end
+    
+    M -->|SETNX| RL
+    D -->|HSET| AS
+    W2 -->|SETEX| HB
+    W3 -->|SETEX| HB
 ```
 
-### Python Implementation with PostgreSQL Advisory Locks
+### Coordination Primitive: Redis Distributed Lock with Heartbeats
 
 ```python
 class DistributedProjectionDaemon:
-    """Distributed projection processor using PostgreSQL advisory locks."""
+    """Python implementation of distributed projection execution"""
     
-    async def process_projection(self, projection_name: str):
-        # Create deterministic lock key from projection name
-        lock_key = self._get_lock_key(projection_name)
-        
-        async with self.pool.acquire() as conn:
-            # Try to acquire advisory lock
-            acquired = await conn.fetchval(
-                "SELECT pg_try_advisory_lock($1)", lock_key
-            )
+    def __init__(self, store, projections, redis_client):
+        self.store = store
+        self.projections = projections
+        self.redis = redis_client
+        self.node_id = str(uuid.uuid4())
+        self.lock_key = "projection:master_lock"
+        self.heartbeat_key = f"projection:heartbeat:{self.node_id}"
+        self.assignment_key = f"projection:assignments:{self.node_id}"
+    
+    async def run(self):
+        """Main loop with leader election"""
+        while True:
+            if await self.acquire_master_lock():
+                await self.run_as_master()
+            else:
+                await self.run_as_worker()
+            await asyncio.sleep(5)
+    
+    async def acquire_master_lock(self) -> bool:
+        """Acquire master lock using Redis SETNX"""
+        acquired = await self.redis.setnx(self.lock_key, self.node_id)
+        if acquired:
+            await self.redis.expire(self.lock_key, 30)
+        return acquired
+    
+    async def run_as_master(self):
+        """Master node - coordinates work distribution"""
+        while await self.is_master():
+            # Get all active nodes
+            nodes = await self.get_active_nodes()
             
-            if not acquired:
-                return  # Another worker is processing this projection
+            # Partition projections using consistent hashing
+            partitions = self.partition_projections(nodes)
             
-            try:
-                # Process batch of events
-                await self._process_batch(conn, projection_name)
-            finally:
-                # Lock auto-released on connection close
-                await conn.execute(
-                    "SELECT pg_advisory_unlock($1)", lock_key
+            # Assign work to nodes
+            for node_id, projections in partitions.items():
+                await self.redis.hset(
+                    f"projection:assignments:{node_id}",
+                    mapping={p: "active" for p in projections}
                 )
+            
+            await asyncio.sleep(10)
     
-    def _get_lock_key(self, name: str) -> int:
-        """Generate deterministic lock key (63-bit for PostgreSQL)."""
-        import hashlib
-        hash_val = int(hashlib.sha256(name.encode()).hexdigest(), 16)
-        return hash_val & ((1 << 63) - 1)
+    async def run_as_worker(self):
+        """Worker node - processes assigned projections"""
+        while not await self.is_master():
+            # Get assignments for this node
+            assignments = await self.redis.hgetall(self.assignment_key)
+            
+            # Process assigned projections
+            for projection_name, status in assignments.items():
+                if status == "active":
+                    await self.process_projection(projection_name)
+            
+            # Send heartbeat
+            await self.redis.setex(self.heartbeat_key, 30, self.node_id)
+            await asyncio.sleep(1)
 ```
 
-### Coordination Architecture
-
-```mermaid
-graph TB
-    subgraph PostgreSQL
-        Events[(Events Table)]
-        CP[(Checkpoints)]
-        Locks[(Advisory Locks)]
-    end
-    
-    subgraph Workers
-        W1[Worker 1<br/>Lock: Summary]
-        W2[Worker 2<br/>Lock: Compliance]
-        W3[Worker 3<br/>Lock: Agent]
-    end
-    
-    Events --> W1
-    Events --> W2
-    Events --> W3
-    
-    W1 --> CP
-    W2 --> CP
-    W3 --> CP
-    
-    W1 -.->|pg_try_advisory_lock| Locks
-    W2 -.->|pg_try_advisory_lock| Locks
-    W3 -.->|pg_try_advisory_lock| Locks
-```
-
-### Coordination Primitive: PostgreSQL Advisory Locks
+### Failure Modes Guarded Against
 
 ```markdown
-| Feature | Benefit |
-|---------|---------|
-| **Built-in** | No additional infrastructure |
-| **Auto-release** | Lock released on connection death (worker crash) |
-| **Deterministic** | Same key → same lock across nodes |
-| **CP Consistency** | Prefers consistency over availability for financial data |
-| **Lightweight** | No table overhead, pure in-memory locks |
+| Failure Mode | Detection | Mitigation |
+|--------------|-----------|------------|
+| **Split Brain | Redis lock prevents multiple masters | Only one node can hold lock |
+| **Node Failure** | Heartbeat expiration (30 seconds) | Work reassigned to other nodes |
+| **Work Duplication** | Atomic assignment via Redis HSET | Each projection assigned to one node |
+| **Cascading Failure** | Worker isolation | One node failure doesn't affect others |
+| **Master Failure** | Lock expiration triggers re-election | New master elected automatically |
 ```
 
-### Failure Mode Guarded Against
+### Comparison with Marten 7.0
 
 ```markdown
-| Failure Scenario | Without Coordination | With Advisory Locks |
-|------------------|---------------------|---------------------|
-| **Split-brain** | Two workers process same projection → duplicate writes | Single processor guaranteed |
-| **Worker death** | Projection stops updating | Lock released, another worker picks up |
-| **Network partition** | Split-brain possible | CP model maintains consistency |
-| **Slow processing** | Workers overlap and conflict | Lock ensures exclusive processing |
-```
-
-### Alternative Coordination Primitives Considered
-
-```markdown
-| Primitive | Pros | Cons | Decision |
-|-----------|------|------|----------|
-| **Redis Locks** | Fast, configurable TTL | Extra dependency, split-brain risk | ❌ Rejected |
-| **SELECT FOR UPDATE** | Simple, no external deps | Longer transactions, lock table needed | ❌ Rejected |
-| **Kafka Consumer Groups** | Built for distribution | Requires Kafka cluster | ❌ Rejected |
-| **PostgreSQL Advisory Locks** | No extra infra, auto-release, CP | Limited to 2^63 keys | ✅ Selected |
+| Feature | Marten 7.0 (.NET) | Python Implementation |
+|---------|-------------------|----------------------|
+| **Coordination** | PostgreSQL advisory locks | Redis distributed locks |
+| **Heartbeat** | Database polling | Redis SETEX with TTL |
+| **Work Distribution** | Round-robin | Consistent hashing |
+| **Failure Detection** | Database timeout | Heartbeat expiration |
+| **Recovery** | Automatic failover | Lock re-election + reassignment |
 
 ```
-
-## 7. Summary of Key Decisions
-
-```markdown
-
-| Decision Point | Chosen Approach | Rationale |
-|----------------|-----------------|-----------|
-| **EDA vs ES**  | Event Sourcing  | Auditability, recoverability, regulatory compliance |
-| **Aggregate Boundaries** | Four separate aggregates | Reduce write contention, enable team independence |
-| **Concurrency Control** | Optimistic with retry | No locks, graceful collision handling |
-| **Consistency Model** | Eventual (projections) | Write throughput prioritized over read consistency |
-| **Schema Evolution** | Upcasting with NULL | Maintain immutability, avoid data fabrication |
-| **Distribution** | PostgreSQL advisory locks | Leverage existing infrastructure, CP consistency |
-```
-
-## 8. Critical Insights for Enterprise Deployment
-
-### The Gas Town Pattern
-
-Named for the infrastructure anti-pattern where agent context is lost on restart. The Ledger solves this by writing every agent action as an event before execution. On restart, agents replay their stream to reconstruct exact context.
-
-### One-Way Door Decisions
-
-Event sourcing is a one-way door decision. Once adopted:
-
-- **Migration complexity is high** - cannot easily revert
-- **Storage requirements grow** - append-only, never delete
-- **But auditability becomes provable** - cryptographic proof
-
-### SLO-Based Architecture
-
-The Ledger is designed to explicit performance contracts:
-
-```markdown
-| Operation | SLO | Criticality |
-|-----------|-----|-------------|
-| Event append | p99 < 100ms | High - agent throughput |
-| Projection query | p99 < 50ms | High - user experience |
-| Temporal query | p99 < 200ms | Medium - compliance |
-| Full replay | < 60 seconds | High - week standard |
-```
-
-### The Governance Conversation
-
-When stakeholders say "we need auditability," the response is:
-
-- "Here's the immutable event store with cryptographic chain"
-- "Here's how we reconstruct any point in time"
-- "Here's how regulators can verify independently"
-- Deployment recommendation within 48 hours
