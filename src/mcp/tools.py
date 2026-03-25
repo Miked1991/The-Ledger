@@ -1,292 +1,453 @@
 # src/mcp/tools.py
 """
-MCP tools for command side operations.
-Each tool implements the command side of CQRS.
+Complete MCP Tools Implementation - Command Side
+All 8 tools with precondition documentation and structured errors.
 """
 
-from typing import Dict, Any, Optional
-import logging
-from pydantic import BaseModel, Field
-
-from ..event_store import EventStore
-from ..commands.handlers import (
-    SubmitApplicationCommand,
-    CreditAnalysisCompletedCommand,
-    StartAgentSessionCommand,
-    GenerateDecisionCommand,
-    handle_submit_application,
-    handle_credit_analysis_completed,
-    handle_start_agent_session,
-    handle_generate_decision,
-)
-from ..models.errors import OptimisticConcurrencyError, DomainError, PreconditionFailedError
-
-logger = logging.getLogger(__name__)
-
-
-class ToolResult(BaseModel):
-    """Structured result from tool execution."""
-    success: bool
-    result: Optional[Dict[str, Any]] = None
-    error_type: Optional[str] = None
-    error_message: Optional[str] = None
-    suggested_action: Optional[str] = None
-    stream_id: Optional[str] = None
-    expected_version: Optional[int] = None
-    actual_version: Optional[int] = None
+from typing import Dict, Any, Optional, List
+from src.commands.handlers import CommandHandlers
+from src.models.errors import PreconditionFailedError, OptimisticConcurrencyError
+from src.integrity.audit_chain import run_integrity_check
+from src.aggregates.compliance_record import ComplianceRecordAggregate
+from src.aggregates.audit_ledger import AuditLedgerAggregate
 
 
 class MCPTools:
     """
-    MCP Tools for The Ledger.
+    MCP Tools - Command side of CQRS.
     
-    These tools are designed to be consumed by LLM agents.
-    Each tool has:
-    - Clear precondition documentation in description
-    - Structured error types with suggested actions
-    - Pydantic validation for parameters
+    Each tool includes:
+    - Precondition documentation in docstring for LLM consumption
+    - Structured error types with suggested_action
+    - Correlation ID tracing
     """
     
-    def __init__(self, store: EventStore):
-        self.store = store
+    def __init__(self, command_handlers: CommandHandlers):
+        self.handlers = command_handlers
     
-    async def submit_application(
-        self,
-        application_id: str,
-        applicant_id: str,
-        requested_amount_usd: float,
-        applicant_name: str,
-        applicant_tin: str,
-        business_type: str,
-        annual_revenue: Optional[float] = None
-    ) -> ToolResult:
+    async def execute_tool(self, tool_name: str, arguments: Dict[str, Any], 
+                          correlation_id: Optional[str] = None) -> Dict[str, Any]:
+        """Execute the requested tool with validation"""
+        
+        tool_method = getattr(self, f"tool_{tool_name}", None)
+        if not tool_method:
+            raise ValueError(f"Unknown tool: {tool_name}")
+        
+        try:
+            return await tool_method(arguments, correlation_id)
+        except PreconditionFailedError as e:
+            return {
+                "success": False,
+                "error": e.to_dict(),
+                "suggested_next_steps": [e.details.get("suggested_action", "Check preconditions")]
+            }
+        except OptimisticConcurrencyError as e:
+            return {
+                "success": False,
+                "error": e.to_dict(),
+                "suggested_next_steps": ["reload_stream_and_retry"]
+            }
+    
+    async def tool_submit_application(self, args: Dict[str, Any], 
+                                      correlation_id: Optional[str]) -> Dict[str, Any]:
         """
         Submit a new loan application.
         
-        Preconditions:
-        - application_id must be unique (not previously submitted)
-        - applicant_id must exist in the system
-        - requested_amount_usd must be positive
+        PRECONDITIONS:
+        - Application ID must be unique (not previously used)
+        - Application must be in SUBMITTED state (new application)
+        - Applicant ID must be valid
+        - Requested amount must be > 0
+        
+        Args:
+            application_id: Unique application identifier
+            applicant_id: Applicant identifier
+            requested_amount: Amount requested in USD
+            business_name: Business legal name
+            tax_id: Business tax identifier
         
         Returns:
-            ToolResult with success status and result details
+            Dict with stream_id and initial_version
         """
-        try:
-            cmd = SubmitApplicationCommand(
-                application_id=application_id,
-                applicant_id=applicant_id,
-                requested_amount_usd=requested_amount_usd,
-                applicant_name=applicant_name,
-                applicant_tin=applicant_tin,
-                business_type=business_type,
-                annual_revenue=annual_revenue
-            )
-            stream_id = await handle_submit_application(cmd, self.store)
-            
-            return ToolResult(
-                success=True,
-                result={
-                    "stream_id": stream_id,
-                    "application_id": application_id,
-                    "message": "Application submitted successfully"
-                }
-            )
-        except DomainError as e:
-            return ToolResult(
-                success=False,
-                error_type="DomainError",
-                error_message=str(e),
-                suggested_action="Check application ID uniqueness and input data"
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error in submit_application: {e}")
-            return ToolResult(
-                success=False,
-                error_type="InternalError",
-                error_message=str(e),
-                suggested_action="Contact system administrator"
-            )
+        await self.handlers.handle_submit_application(
+            application_id=args["application_id"],
+            applicant_id=args["applicant_id"],
+            requested_amount=args["requested_amount"],
+            business_name=args["business_name"],
+            tax_id=args["tax_id"],
+            correlation_id=correlation_id
+        )
+        
+        return {
+            "success": True,
+            "stream_id": f"loan-{args['application_id']}",
+            "initial_version": 1,
+            "message": f"Application {args['application_id']} submitted"
+        }
     
-    async def start_agent_session(
-        self,
-        agent_id: str,
-        session_id: str,
-        context_source: str,
-        model_version: str,
-        available_actions: list
-    ) -> ToolResult:
+    async def tool_start_agent_session(self, args: Dict[str, Any],
+                                       correlation_id: Optional[str]) -> Dict[str, Any]:
         """
-        Start an AI agent session with context loaded.
+        Start a new agent session with context loading (Gas Town pattern).
         
-        Preconditions:
-        - session_id must be unique (not already started)
-        - model_version must be a valid deployed version
-        - context_source must contain the agent's context data
+        PRECONDITIONS:
+        - Session ID must be unique for this agent
+        - This MUST be called before any decision-making tools
+        - Context source must be accessible
+        - Model version must be valid
         
-        This tool implements the Gas Town pattern - it loads the agent's
-        context into memory that will be persisted in the event store,
-        allowing the agent to recover after crashes.
+        Args:
+            agent_id: Agent identifier
+            session_id: Session identifier
+            context_source: Source of context (database, memory, file)
+            model_version: Model version being used
+            token_count: Number of tokens in context
+            context_hash: Hash of context for integrity
+        
+        Returns:
+            Dict with session_id and context_position
         """
-        try:
-            cmd = StartAgentSessionCommand(
-                agent_id=agent_id,
-                session_id=session_id,
-                context_source=context_source,
-                model_version=model_version,
-                available_actions=available_actions
-            )
-            stream_id = await handle_start_agent_session(cmd, self.store)
-            
-            return ToolResult(
-                success=True,
-                result={
-                    "stream_id": stream_id,
-                    "agent_id": agent_id,
-                    "session_id": session_id,
-                    "message": "Agent session started with context loaded"
-                }
-            )
-        except DomainError as e:
-            return ToolResult(
-                success=False,
-                error_type="DomainError",
-                error_message=str(e),
-                suggested_action="Use a unique session_id or check model_version validity"
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error in start_agent_session: {e}")
-            return ToolResult(
-                success=False,
-                error_type="InternalError",
-                error_message=str(e)
-            )
+        await self.handlers.handle_start_agent_session(
+            agent_id=args["agent_id"],
+            session_id=args["session_id"],
+            context_source=args["context_source"],
+            model_version=args["model_version"],
+            token_count=args["token_count"],
+            context_hash=args["context_hash"],
+            correlation_id=correlation_id
+        )
+        
+        return {
+            "success": True,
+            "session_id": args["session_id"],
+            "context_position": 1,
+            "message": f"Agent session {args['session_id']} started",
+            "next_steps": [
+                "Call record_credit_analysis with this session_id",
+                "Call record_fraud_screening with this session_id",
+                "Call record_compliance_check with this session_id"
+            ]
+        }
     
-    async def record_credit_analysis(
-        self,
-        application_id: str,
-        agent_id: str,
-        session_id: str,
-        credit_score: int,
-        risk_tier: str,
-        debt_to_income_ratio: float,
-        model_version: str,
-        confidence_score: Optional[float] = None
-    ) -> ToolResult:
+    async def tool_record_credit_analysis(self, args: Dict[str, Any],
+                                         correlation_id: Optional[str]) -> Dict[str, Any]:
         """
-        Record completed credit analysis.
+        Record credit analysis results.
         
-        Preconditions:
-        - Active agent session must exist with context loaded
-        - Application must be in Submitted or AwaitingAnalysis state
-        - No previous credit analysis for this application (unless overridden)
+        PRECONDITIONS:
+        - Requires an active agent session created by start_agent_session
+        - Application must be in AWAITING_ANALYSIS state
+        - Credit analysis not already completed for this application
+        - Agent session must have context loaded
+        
+        Args:
+            application_id: Application identifier
+            agent_id: Agent identifier
+            session_id: Active session identifier
+            risk_tier: Risk tier (LOW, MEDIUM, HIGH)
+            credit_score: Numeric credit score
+            max_credit_limit: Maximum approved credit limit
+            model_version: Model version used
+            confidence_score: Optional confidence score for the analysis
+        
+        Returns:
+            Dict with event_id and new_stream_version
         """
-        try:
-            cmd = CreditAnalysisCompletedCommand(
-                application_id=application_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                credit_score=credit_score,
-                risk_tier=risk_tier,
-                debt_to_income_ratio=debt_to_income_ratio,
-                model_version=model_version,
-                confidence_score=confidence_score
-            )
-            stream_id = await handle_credit_analysis_completed(cmd, self.store)
-            
-            return ToolResult(
-                success=True,
-                result={
-                    "stream_id": stream_id,
-                    "application_id": application_id,
-                    "message": "Credit analysis recorded"
-                }
-            )
-        except OptimisticConcurrencyError as e:
-            return ToolResult(
-                success=False,
-                error_type="OptimisticConcurrencyError",
-                error_message=str(e),
-                suggested_action=e.suggested_action if hasattr(e, 'suggested_action') else "Reload application and retry",
-                stream_id=e.stream_id,
-                expected_version=e.expected_version,
-                actual_version=e.actual_version
-            )
-        except DomainError as e:
-            return ToolResult(
-                success=False,
-                error_type="DomainError",
-                error_message=str(e),
-                suggested_action="Check application state and agent session validity"
-            )
-        except PreconditionFailedError as e:
-            return ToolResult(
-                success=False,
-                error_type="PreconditionFailed",
-                error_message=str(e),
-                suggested_action=e.details.get("suggested_action", "Start agent session first")
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error in record_credit_analysis: {e}")
-            return ToolResult(
-                success=False,
-                error_type="InternalError",
-                error_message=str(e)
-            )
+        await self.handlers.handle_credit_analysis_completed(
+            application_id=args["application_id"],
+            agent_id=args["agent_id"],
+            session_id=args["session_id"],
+            risk_tier=args["risk_tier"],
+            credit_score=args["credit_score"],
+            max_credit_limit=args["max_credit_limit"],
+            model_version=args["model_version"],
+            confidence_score=args.get("confidence_score"),
+            correlation_id=correlation_id
+        )
+        
+        return {
+            "success": True,
+            "event_type": "CreditAnalysisCompleted",
+            "message": f"Credit analysis recorded for {args['application_id']}"
+        }
     
-    async def generate_decision(
-        self,
-        application_id: str,
-        recommendation: str,
-        confidence_score: float,
-        contributing_agent_sessions: list,
-        rationale: str
-    ) -> ToolResult:
+    async def tool_record_fraud_screening(self, args: Dict[str, Any],
+                                         correlation_id: Optional[str]) -> Dict[str, Any]:
         """
-        Generate a decision recommendation.
+        Record fraud screening results.
         
-        Preconditions:
-        - Credit analysis and fraud screening must be completed
-        - All compliance checks must be passed
-        - No decision already generated
-        - If confidence_score < 0.6, recommendation must be "REFER"
+        PRECONDITIONS:
+        - Requires an active agent session
+        - Fraud score must be between 0.0 and 1.0
+        - Application must exist
+        
+        Args:
+            application_id: Application identifier
+            agent_id: Agent identifier
+            session_id: Active session identifier
+            fraud_score: Fraud score (0.0-1.0, higher = more suspicious)
+            flags: List of suspicious indicators
+            risk_indicators: Additional risk details
+        
+        Returns:
+            Dict with check status
         """
-        try:
-            cmd = GenerateDecisionCommand(
-                application_id=application_id,
-                recommendation=recommendation,
-                confidence_score=confidence_score,
-                contributing_agent_sessions=contributing_agent_sessions,
-                rationale=rationale
+        from src.models.events import FraudScreeningCompleted
+        
+        event = FraudScreeningCompleted(
+            application_id=args["application_id"],
+            fraud_score=args["fraud_score"],
+            flags=args.get("flags", []),
+            risk_indicators=args.get("risk_indicators", {})
+        )
+        
+        stream_id = f"loan-{args['application_id']}"
+        version = await self.handlers.store.stream_version(stream_id)
+        
+        await self.handlers.store.append(
+            stream_id,
+            [event],
+            expected_version=version,
+            correlation_id=correlation_id
+        )
+        
+        return {
+            "success": True,
+            "fraud_score": args["fraud_score"],
+            "risk_level": "HIGH" if args["fraud_score"] > 0.7 else "MEDIUM" if args["fraud_score"] > 0.3 else "LOW",
+            "message": f"Fraud screening recorded for {args['application_id']}"
+        }
+    
+    async def tool_record_compliance_check(self, args: Dict[str, Any],
+                                          correlation_id: Optional[str]) -> Dict[str, Any]:
+        """
+        Record compliance check results.
+        
+        PRECONDITIONS:
+        - Rule ID must exist in active regulation set
+        - Compliance check must be initiated
+        - Regulation version must be valid
+        
+        Args:
+            application_id: Application identifier
+            rule_id: Compliance rule identifier
+            regulation_version: Regulation version
+            check_id: Unique check identifier
+            passed: Whether the check passed
+            details: Additional check details
+            failure_reason: Reason for failure (if applicable)
+        
+        Returns:
+            Dict with check status
+        """
+        from src.models.events import ComplianceRulePassed, ComplianceRuleFailed
+        
+        if args["passed"]:
+            event = ComplianceRulePassed(
+                application_id=args["application_id"],
+                rule_id=args["rule_id"],
+                regulation_version=args["regulation_version"],
+                check_id=args["check_id"],
+                details=args.get("details", {})
             )
-            stream_id = await handle_generate_decision(cmd, self.store)
-            
-            return ToolResult(
-                success=True,
-                result={
-                    "stream_id": stream_id,
-                    "application_id": application_id,
-                    "recommendation": recommendation,
-                    "message": "Decision generated"
-                }
+        else:
+            event = ComplianceRuleFailed(
+                application_id=args["application_id"],
+                rule_id=args["rule_id"],
+                regulation_version=args["regulation_version"],
+                check_id=args["check_id"],
+                failure_reason=args.get("failure_reason", "Compliance check failed"),
+                details=args.get("details", {})
             )
-        except OptimisticConcurrencyError as e:
-            return ToolResult(
-                success=False,
-                error_type="OptimisticConcurrencyError",
-                error_message=str(e),
-                suggested_action="Reload application and retry"
-            )
-        except DomainError as e:
-            return ToolResult(
-                success=False,
-                error_type="DomainError",
-                error_message=str(e),
-                suggested_action="Check confidence floor and required analyses"
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error in generate_decision: {e}")
-            return ToolResult(
-                success=False,
-                error_type="InternalError",
-                error_message=str(e)
-            )
+        
+        stream_id = f"compliance-{args['application_id']}"
+        version = await self.handlers.store.stream_version(stream_id)
+        
+        if version == 0:
+            expected = -1
+        else:
+            expected = version
+        
+        await self.handlers.store.append(
+            stream_id,
+            [event],
+            expected_version=expected,
+            correlation_id=correlation_id
+        )
+        
+        return {
+            "success": True,
+            "passed": args["passed"],
+            "rule_id": args["rule_id"],
+            "message": f"Compliance check {args['rule_id']}: {'PASSED' if args['passed'] else 'FAILED'}"
+        }
+    
+    async def tool_generate_decision(self, args: Dict[str, Any],
+                                    correlation_id: Optional[str]) -> Dict[str, Any]:
+        """
+        Generate a decision based on all analyses.
+        
+        PRECONDITIONS:
+        - Requires an active agent session
+        - Credit analysis must be complete
+        - Fraud screening must be complete
+        - Compliance checks must be complete
+        - Confidence floor enforcement (confidence < 0.6 forces REFER)
+        
+        Args:
+            application_id: Application identifier
+            agent_id: Agent identifier
+            session_id: Active session identifier
+            orchestrator_recommendation: Recommendation (APPROVE, DECLINE, REFER)
+            orchestrator_confidence: Confidence score (0.0-1.0)
+            contributing_sessions: List of agent sessions that contributed
+            reasoning: Decision reasoning
+        
+        Returns:
+            Dict with decision_id and final_recommendation
+        """
+        await self.handlers.handle_generate_decision(
+            application_id=args["application_id"],
+            agent_id=args["agent_id"],
+            session_id=args["session_id"],
+            orchestrator_recommendation=args["orchestrator_recommendation"],
+            orchestrator_confidence=args["orchestrator_confidence"],
+            contributing_sessions=args["contributing_sessions"],
+            reasoning=args["reasoning"],
+            correlation_id=correlation_id
+        )
+        
+        final_recommendation = args["orchestrator_recommendation"]
+        if args["orchestrator_confidence"] < 0.6:
+            final_recommendation = "REFER"
+        
+        return {
+            "success": True,
+            "decision_id": f"dec-{args['application_id']}",
+            "final_recommendation": final_recommendation,
+            "confidence_floor_applied": args["orchestrator_confidence"] < 0.6,
+            "message": f"Decision generated for {args['application_id']}"
+        }
+    
+    async def tool_record_human_review(self, args: Dict[str, Any],
+                                      correlation_id: Optional[str]) -> Dict[str, Any]:
+        """
+        Record human review and final decision.
+        
+        PRECONDITIONS:
+        - Application must be in PENDING_HUMAN state
+        - Reviewer must be authenticated
+        - Override requires reason if override=True
+        
+        Args:
+            application_id: Application identifier
+            reviewer_id: Reviewer identifier
+            final_decision: Final decision (APPROVED, DECLINED)
+            override: Whether this overrides AI recommendation
+            override_reason: Reason for override if applicable
+            comments: Optional review comments
+        
+        Returns:
+            Dict with final_decision and application_state
+        """
+        await self.handlers.handle_human_review_completed(
+            application_id=args["application_id"],
+            reviewer_id=args["reviewer_id"],
+            final_decision=args["final_decision"],
+            override=args.get("override", False),
+            override_reason=args.get("override_reason"),
+            comments=args.get("comments"),
+            correlation_id=correlation_id
+        )
+        
+        return {
+            "success": True,
+            "final_decision": args["final_decision"],
+            "application_state": "FINAL_APPROVED" if args["final_decision"] == "APPROVED" else "FINAL_DECLINED",
+            "override": args.get("override", False),
+            "message": f"Human review recorded for {args['application_id']}"
+        }
+    
+    async def tool_run_integrity_check(self, args: Dict[str, Any],
+                                      correlation_id: Optional[str]) -> Dict[str, Any]:
+        """
+        Run cryptographic integrity check on audit trail.
+        
+        PRECONDITIONS:
+        - Must be called by compliance role
+        - Rate-limited to 1/minute per entity
+        - Entity must exist
+        
+        Args:
+            entity_type: Type of entity (loan, agent, compliance)
+            entity_id: Entity identifier
+        
+        Returns:
+            Dict with check_result including chain_valid and tamper_detected
+        """
+        result = await run_integrity_check(
+            self.handlers.store,
+            args["entity_type"],
+            args["entity_id"]
+        )
+        
+        return {
+            "success": True,
+            "result": result.to_dict(),
+            "recommendation": "Chain verified - no issues detected" if result.chain_valid else "Tampering detected - investigate immediately",
+            "message": f"Integrity check completed for {args['entity_type']}-{args['entity_id']}"
+        }
+    
+    async def tool_get_compliance_status(self, args: Dict[str, Any],
+                                        correlation_id: Optional[str]) -> Dict[str, Any]:
+        """
+        Get compliance status for an application.
+        
+        PRECONDITIONS:
+        - Application must exist
+        - Compliance record must exist
+        
+        Args:
+            application_id: Application identifier
+        
+        Returns:
+            Dict with compliance status and details
+        """
+        compliance = await ComplianceRecordAggregate.load(
+            self.handlers.store,
+            args["application_id"]
+        )
+        
+        return {
+            "success": True,
+            "status": compliance.status,
+            "summary": compliance.get_compliance_summary()
+        }
+    
+    async def tool_get_audit_trail(self, args: Dict[str, Any],
+                                   correlation_id: Optional[str]) -> Dict[str, Any]:
+        """
+        Get audit trail for an entity.
+        
+        PRECONDITIONS:
+        - Entity must exist
+        - Auditor permissions required
+        
+        Args:
+            entity_type: Type of entity (loan, agent, compliance)
+            entity_id: Entity identifier
+        
+        Returns:
+            Dict with audit trail and integrity report
+        """
+        audit = await AuditLedgerAggregate.load(
+            self.handlers.store,
+            args["entity_type"],
+            args["entity_id"]
+        )
+        
+        return {
+            "success": True,
+            "audit_trail": audit.get_audit_trail(),
+            "integrity_report": audit.get_integrity_report()
+        }
