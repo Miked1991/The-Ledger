@@ -1,6 +1,7 @@
 # DESIGN.md
 
 ```markdown
+
 # DESIGN.md - Architecture & Tradeoff Analysis
 
 ## 1. Aggregate Boundary Justification
@@ -334,3 +335,5 @@ Elasticsearch is better for:
 - Temporal queries at scale
 
 For production enterprise deployment, the added complexity is justified. At scale (1000+ applications/hour, complex search requirements), PostgreSQL projections become the bottleneck. A dedicated search index with proper sharding supports 10x the throughput with better user experience.
+
+```
