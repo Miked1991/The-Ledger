@@ -194,13 +194,31 @@ Your LoanApplication projection is eventually consistent with a typical lag of 2
 ### System Response Strategy
 
 ```mermaid
-graph TD
-    A[User Query] --> B{Check Pending Events}
-    B -->|Has Pending| C[Show Optimistic Value]
-    B -->|No Pending| D[Show Current Value]
-    C --> E[Show "Updating..." Indicator]
-    C --> F[WebSocket Push Update]
-    F --> G[Refresh UI]
+graph TB
+    subgraph "Event Flow"
+        A[Agent Commits Disbursement Event] --> B[Event Written to PostgreSQL]
+        B --> C[Projection Daemon Polls]
+        C --> D[Projection Updates<br/>~200ms lag]
+    end
+    
+    subgraph "User Query Flow"
+        E[Loan Officer Queries] --> F{Check Pending Events}
+        F -->|Has Pending Disbursements| G[Calculate Optimistic Value]
+        F -->|No Pending| H[Return Current Limit]
+        G --> I[Display with Status Indicator]
+        I --> J[Subscribe to WebSocket]
+        J --> K[Receive Push Update]
+        K --> L[Refresh UI Automatically]
+    end
+    
+    subgraph "Communication Layer"
+        M[WebSocket Channel] --> N[Push Event]
+        O[Event Source] --> P[SSE Stream]
+        Q[Polling Fallback] --> R[Periodic Refresh]
+    end
+    
+    B -.->|Listen/NOTIFY| M
+    D --> N
 ```
 
 ### User Interface Communication
